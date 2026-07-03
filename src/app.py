@@ -4,12 +4,15 @@ Run with:  py -m streamlit run src\\app.py   (or just run main.py)
 """
 
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pandas_market_calendars as mcal
 import streamlit as st
 
+from collector import fetch_chain_rows, TICKERS
+from db import get_connection, insert_rows
 from detector import (load_universe, bucket_baseline, score_day,
                       flags_for_day, composite, LOOKBACK_DAYS, MIN_HISTORY)
 from report import load_day, build_report
@@ -103,6 +106,52 @@ To refresh the all-time score table after new collection days, run:
 # ============================ SCANNER TAB ============================
 with tab_scan:
     st.caption(f"Database: {len(dates)} trading days, {dates[0]} → {dates[-1]}")
+
+# ---------- Freshness check & one-click collection ----------
+    @st.cache_data(ttl=3600)
+    def last_expected_trading_day() -> date:
+        """Most recent NYSE session whose close has already passed."""
+        now_et = pd.Timestamp.now(tz="America/New_York")
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(start_date=now_et.date() - timedelta(days=10),
+                              end_date=now_et.date())
+        closed = sched[sched["market_close"] <= now_et]
+        return closed.index[-1].date()
+
+    latest_in_db = date.fromisoformat(dates[-1])
+    expected = last_expected_trading_day()
+
+    if latest_in_db < expected:
+        nyse_now = pd.Timestamp.now(tz="America/New_York")
+        sched_today = mcal.get_calendar("NYSE").schedule(
+            start_date=nyse_now.date(), end_date=nyse_now.date())
+        market_open = (not sched_today.empty
+                       and sched_today["market_open"].iloc[0] <= nyse_now
+                       <= sched_today["market_close"].iloc[0])
+
+        st.warning(f"Database's latest snapshot is **{latest_in_db}**, but the most "
+                   f"recent completed trading day is **{expected}**.")
+        if market_open:
+            st.caption("⚠️ The market is currently open — collecting now stores "
+                       "partial-day volume. Best practice: collect after 2:00 PM MT.")
+
+        if st.button("📡 Collect latest data now"):
+            with st.spinner("Pulling option chains from yfinance (1–3 min)..."):
+                conn = get_connection()
+                try:
+                    for tkr in TICKERS:
+                        rows = fetch_chain_rows(tkr)
+                        insert_rows(conn, rows)
+                        st.write(f"{tkr}: {len(rows):,} contracts stored")
+                finally:
+                    conn.close()
+            get_dates.clear()               # invalidate the cached date list
+            st.success("Collection complete — refreshing...")
+            st.rerun()
+    else:
+        st.caption(f"✅ Data is up to date (latest snapshot: {latest_in_db}).")
+    # -------------------------------------------------------------
+
 
     picked = st.date_input("Pick a date", value=d_max, min_value=d_min, max_value=d_max)
     target = max((d for d in dates if d <= picked.isoformat()), default=None)
