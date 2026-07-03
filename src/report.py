@@ -15,6 +15,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "options.db"
 REPORTS = ROOT / "reports"
+SCORES_CSV = ROOT / "data" / "daily_scores.csv"
 
 HEADER_FILL = PatternFill("solid", start_color="1F3864")
 HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial")
@@ -22,14 +23,20 @@ TITLE_FONT = Font(bold=True, size=14, name="Arial")
 BODY_FONT = Font(name="Arial")
 
 
-def load_latest() -> pd.DataFrame:
+def load_day(target_date: str | None = None) -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
-    latest = conn.execute("SELECT MAX(snapshot_date) FROM chain_snapshots").fetchone()[0]
+    if target_date is None:
+        target_date = conn.execute(
+            "SELECT MAX(snapshot_date) FROM chain_snapshots").fetchone()[0]
     df = pd.read_sql(
         "SELECT * FROM chain_snapshots WHERE snapshot_date = ?",
-        conn, params=[latest], parse_dates=["snapshot_date", "expiry"],
+        conn, params=[target_date], parse_dates=["snapshot_date", "expiry"],
     )
     conn.close()
+    if df.empty:
+        raise ValueError(f"No data for {target_date} (not a trading day in the DB?)")
+    df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["dte"] = (df["expiry"] - df["snapshot_date"]).dt.days
     df["moneyness"] = df["strike"] / df["spot_price"]
     df["vol_oi_ratio"] = df["volume"] / df["open_interest"].replace(0, pd.NA)
@@ -67,6 +74,10 @@ def styled_header(ws, row: int, headers: list[str]) -> None:
         cell.fill = HEADER_FILL; cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center")
 
+def load_scores() -> pd.DataFrame | None:
+    if not SCORES_CSV.exists():
+        return None
+    return pd.read_csv(SCORES_CSV, parse_dates=["date"])
 
 def build_report(df: pd.DataFrame) -> Path:
     REPORTS.mkdir(exist_ok=True)
@@ -88,7 +99,9 @@ def build_report(df: pd.DataFrame) -> Path:
         ("Call volume", call_vol),
         ("Put volume", put_vol),
         ("Put/Call ratio", round(put_vol / call_vol, 3)),
-        ("Contracts with volume > OI", int((df["volume"] > df["open_interest"]).sum())),
+        ("Contracts with volume > OI",
+         int((df["volume"] > df["open_interest"]).sum())
+         if df["open_interest"].notna().any() else "n/a (no OI in source)"),
         ("Expiries", int(df["expiry"].nunique())),
     ]
     styled_header(ws, 3, ["Metric", "Value"])
@@ -120,6 +133,49 @@ def build_report(df: pd.DataFrame) -> Path:
         ws3.column_dimensions[col_letter].width = 14
     ws3.freeze_panes = "A2"
 
+# ---- Sheet 4: Historical context ----
+    scores = load_scores()
+    if scores is not None and (scores["date"] == pd.Timestamp(snap)).any():
+        ws4 = wb.create_sheet("Historical Context")
+        ws4["A1"] = f"How does {snap} compare to history?"
+        ws4["A1"].font = TITLE_FONT
+
+        row_today = scores.loc[scores["date"] == pd.Timestamp(snap)].iloc[0]
+        pct = (scores["score"] <= row_today["score"]).mean() * 100
+        pct_put = (scores["put_score"] <= row_today["put_score"]).mean() * 100
+        pct_call = (scores["call_score"] <= row_today["call_score"]).mean() * 100
+        rank = int((scores["score"] > row_today["score"]).sum()) + 1
+
+        ctx = [
+            ("Composite score", round(float(row_today["score"]), 3)),
+            ("Percentile vs all history", f"{pct:.1f}%"),
+            ("Rank (1 = most anomalous ever)", f"{rank} of {len(scores)}"),
+            ("Call score percentile", f"{pct_call:.1f}%"),
+            ("Put score percentile", f"{pct_put:.1f}%"),
+            ("History covers", f"{scores['date'].min().date()} to {scores['date'].max().date()}"),
+        ]
+        styled_header(ws4, 3, ["Metric", "Value"])
+        for i, (name, val) in enumerate(ctx, start=4):
+            ws4.cell(row=i, column=1, value=name).font = BODY_FONT
+            ws4.cell(row=i, column=2, value=val).font = BODY_FONT
+        ws4.column_dimensions["A"].width = 34
+        ws4.column_dimensions["B"].width = 26
+
+        # Score-through-time chart with today marked
+        fig, ax = plt.subplots(figsize=(9, 3.5))
+        ax.plot(scores["date"], scores["score"], lw=0.7, color="#1F3864")
+        ax.axhline(scores["score"].quantile(0.90), ls="--", color="#C62828",
+                   lw=1, label="90th percentile")
+        ax.scatter([row_today["date"]], [row_today["score"]], color="#C62828",
+                   zorder=5, s=60, label=f"This report ({snap})")
+        ax.set_title("Daily composite anomaly score, full history")
+        ax.legend(); fig.tight_layout()
+        chart_path = REPORTS / "_chart_history.png"
+        fig.savefig(chart_path, dpi=110); plt.close(fig)
+        ws4.add_image(XLImage(str(chart_path)), "D3")
+        # register for cleanup alongside the other temp charts
+        charts["history"] = chart_path
+
     wb.save(out)
     for p in charts.values():  # clean up temp chart images
         p.unlink(missing_ok=True)
@@ -127,6 +183,6 @@ def build_report(df: pd.DataFrame) -> Path:
 
 
 if __name__ == "__main__":
-    df = load_latest()
+    df = load_day()
     path = build_report(df)
     print(f"Report written: {path}")
