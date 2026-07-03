@@ -1,0 +1,132 @@
+"""Generate a dated Excel data report into reports/ each run."""
+
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # render charts without opening windows
+import matplotlib.pyplot as plt
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = ROOT / "data" / "options.db"
+REPORTS = ROOT / "reports"
+
+HEADER_FILL = PatternFill("solid", start_color="1F3864")
+HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial")
+TITLE_FONT = Font(bold=True, size=14, name="Arial")
+BODY_FONT = Font(name="Arial")
+
+
+def load_latest() -> pd.DataFrame:
+    conn = sqlite3.connect(DB_PATH)
+    latest = conn.execute("SELECT MAX(snapshot_date) FROM chain_snapshots").fetchone()[0]
+    df = pd.read_sql(
+        "SELECT * FROM chain_snapshots WHERE snapshot_date = ?",
+        conn, params=[latest], parse_dates=["snapshot_date", "expiry"],
+    )
+    conn.close()
+    df["dte"] = (df["expiry"] - df["snapshot_date"]).dt.days
+    df["moneyness"] = df["strike"] / df["spot_price"]
+    df["vol_oi_ratio"] = df["volume"] / df["open_interest"].replace(0, pd.NA)
+    return df
+
+
+def make_charts(df: pd.DataFrame, outdir: Path) -> dict[str, Path]:
+    paths = {}
+
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    buckets = pd.cut(df["dte"], bins=[-1, 1, 7, 30, 90, 10_000],
+                     labels=["0-1d", "2-7d", "8-30d", "31-90d", ">90d"])
+    df.groupby(buckets, observed=True)["volume"].sum().plot.bar(ax=ax, color="#1F3864")
+    ax.set_title("Volume by days to expiry"); ax.set_xlabel(""); ax.set_ylabel("Contracts")
+    fig.tight_layout()
+    paths["dte"] = outdir / "_chart_dte.png"; fig.savefig(paths["dte"], dpi=110); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    near = df[(df["moneyness"].between(0.9, 1.1)) & (df["dte"] <= 30)]
+    for opt, color in (("C", "#2E7D32"), ("P", "#C62828")):
+        sub = near[near["option_type"] == opt].groupby("strike")["volume"].sum()
+        ax.plot(sub.index, sub.values, label="Calls" if opt == "C" else "Puts", color=color)
+    ax.axvline(df["spot_price"].iloc[0], ls="--", color="gray", label="Spot")
+    ax.set_title("Volume by strike (±10% of spot, ≤30 DTE)")
+    ax.set_xlabel("Strike"); ax.set_ylabel("Contracts"); ax.legend()
+    fig.tight_layout()
+    paths["strike"] = outdir / "_chart_strike.png"; fig.savefig(paths["strike"], dpi=110); plt.close(fig)
+
+    return paths
+
+
+def styled_header(ws, row: int, headers: list[str]) -> None:
+    for col, h in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=col, value=h)
+        cell.fill = HEADER_FILL; cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+
+
+def build_report(df: pd.DataFrame) -> Path:
+    REPORTS.mkdir(exist_ok=True)
+    snap = df["snapshot_date"].iloc[0].date().isoformat()
+    out = REPORTS / f"report_{snap}.xlsx"
+
+    wb = Workbook()
+
+    # ---- Sheet 1: Summary ----
+    ws = wb.active; ws.title = "Summary"
+    ws["A1"] = f"SPY Options Chain Report — {snap}"; ws["A1"].font = TITLE_FONT
+
+    call_vol = int(df.loc[df.option_type == "C", "volume"].sum())
+    put_vol = int(df.loc[df.option_type == "P", "volume"].sum())
+    stats = [
+        ("Spot price", round(float(df["spot_price"].iloc[0]), 2)),
+        ("Total contracts", len(df)),
+        ("Total volume", int(df["volume"].sum())),
+        ("Call volume", call_vol),
+        ("Put volume", put_vol),
+        ("Put/Call ratio", round(put_vol / call_vol, 3)),
+        ("Contracts with volume > OI", int((df["volume"] > df["open_interest"]).sum())),
+        ("Expiries", int(df["expiry"].nunique())),
+    ]
+    styled_header(ws, 3, ["Metric", "Value"])
+    for i, (name, val) in enumerate(stats, start=4):
+        ws.cell(row=i, column=1, value=name).font = BODY_FONT
+        c = ws.cell(row=i, column=2, value=val); c.font = BODY_FONT
+        c.number_format = "#,##0" if isinstance(val, int) else "#,##0.00"
+    ws.column_dimensions["A"].width = 30; ws.column_dimensions["B"].width = 16
+
+    # ---- Sheet 2: Charts ----
+    ws2 = wb.create_sheet("Charts")
+    charts = make_charts(df, REPORTS)
+    ws2.add_image(XLImage(str(charts["dte"])), "B2")
+    ws2.add_image(XLImage(str(charts["strike"])), "B22")
+
+    # ---- Sheet 3: Top activity ----
+    ws3 = wb.create_sheet("Top Activity")
+    cols = ["option_type", "strike", "expiry", "dte", "volume",
+            "open_interest", "vol_oi_ratio", "implied_vol"]
+    top = df.nlargest(25, "volume")[cols].copy()
+    top["expiry"] = top["expiry"].dt.date.astype(str)
+    top["vol_oi_ratio"] = top["vol_oi_ratio"].astype(float).round(2)
+    top["implied_vol"] = top["implied_vol"].round(4)
+    styled_header(ws3, 1, cols)
+    for r_idx, row in enumerate(dataframe_to_rows(top, index=False, header=False), start=2):
+        for c_idx, val in enumerate(row, start=1):
+            ws3.cell(row=r_idx, column=c_idx, value=val).font = BODY_FONT
+    for col_letter in "ABCDEFGH":
+        ws3.column_dimensions[col_letter].width = 14
+    ws3.freeze_panes = "A2"
+
+    wb.save(out)
+    for p in charts.values():  # clean up temp chart images
+        p.unlink(missing_ok=True)
+    return out
+
+
+if __name__ == "__main__":
+    df = load_latest()
+    path = build_report(df)
+    print(f"Report written: {path}")
