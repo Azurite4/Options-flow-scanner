@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-data/*.db
-data/*.csv
+data/
+!data/.gitkeep
 .ipynb_checkpoints/
 reports/
+
