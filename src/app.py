@@ -36,6 +36,9 @@ def get_dates() -> list[str]:
     conn.close()
     return d
 
+@st.cache_data(show_spinner=False)
+def get_grid(date_str: str):
+    return build_grid(load_chain_day(date_str))
 
 dates = get_dates()
 d_min, d_max = date.fromisoformat(dates[0]), date.fromisoformat(dates[-1])
@@ -251,15 +254,7 @@ with tab_scan:
         st.info(f"No snapshot for {picked} (weekend, holiday, or data gap). "
                 f"Using the most recent trading day before it: **{target}**")
 
-    col_run, col_toggle = st.columns([1, 2])
-    with col_toggle:
-        make_report = st.toggle("Generate Excel report after scan", value=False,
-                                help="Off = quick scan only (faster). On = also build and "
-                                     "archive the full Excel report in reports/.")
-    with col_run:
-        run = st.button(f"Run scan for {target}", type="primary")
-
-    if run:
+    if st.button(f"Run scan for {target}", type="primary"):
         with st.spinner("Scoring chain against trailing baseline..."):
             conn = sqlite3.connect(DB_PATH)
             uni = load_universe(conn)
@@ -279,16 +274,29 @@ with tab_scan:
                 st.stop()
 
             hist_dates = pd.to_datetime(sorted(history["snapshot_date"].unique()))
-            span = (pd.Timestamp(actual) - hist_dates.min()).days
-            if span > LOOKBACK_DAYS * 3:
-                st.warning(f"Baseline spans {span} calendar days due to the gap in "
-                           f"the database — this date is being compared against "
-                           f"older market conditions (see Instructions tab). "
-                           f"Read scores with caution.")
+            span = int((pd.Timestamp(actual) - hist_dates.min()).days)
 
             scored = score_day(today, bucket_baseline(history))
-            comp = composite(scored, history)
-            flags = flags_for_day(scored)
+            st.session_state["scan"] = {
+                "target": target,
+                "comp": composite(scored, history),
+                "flags": flags_for_day(scored),
+                "span": span,
+                "n_days": n_days,
+            }
+            st.session_state.pop("report_path", None)
+
+    scan = st.session_state.get("scan")
+    if scan is not None and scan["target"] != target:
+        st.caption(f"Showing nothing yet for {target} — hit Run scan. "
+                   f"(Last scan was {scan['target']}.)")
+    elif scan is not None:
+        comp, flags = scan["comp"], scan["flags"]
+
+        if scan["span"] > LOOKBACK_DAYS * 3:
+            st.warning(f"Baseline spans {scan['span']} calendar days due to the gap in "
+                       f"the database — this date is compared against older market "
+                       f"conditions (see Instructions tab). Read scores with caution.")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Composite score", f"{comp['score']:.3f}")
@@ -306,9 +314,10 @@ with tab_scan:
             show["dist"] = (show["dist"] * 100).round(1)
             show = show.rename(columns={"dist": "% from spot"})
             st.dataframe(show, use_container_width=True, hide_index=True)
+
         st.subheader("Implied volatility surface")
         try:
-            grid = build_grid(load_chain_day(target))
+            grid = get_grid(target)
             sstats = surface_stats(grid)
             sc1, sc2 = st.columns(2)
             slope = sstats.get("term_slope")
@@ -319,31 +328,33 @@ with tab_scan:
             lw = sstats.get("left_wing")
             sc2.metric("Left-wing steepness (~1m)",
                        f"{lw:+.3f}" if lw is not None else "n/a")
+
             abs_scale = st.toggle("Absolute scale (compare across dates)", value=True,
-                                  help="On: 0-100% IV fixed — crisis days tower, calm days "
-                                       "sit flat. Off: surface fills the frame (shape detail).")
+                                  help="On: fixed IV scale — crisis days tower, calm days "
+                                       "sit flat. Off: surface fills the frame.")
             st.plotly_chart(plotly_surface(grid, target, absolute_scale=abs_scale),
                             use_container_width=True)
             t1, t2 = st.columns(2)
             t1.plotly_chart(term_structure_fig(grid, target), use_container_width=True)
             t2.plotly_chart(smile_fig(grid, target), use_container_width=True)
-            st.caption("Drag to rotate. Height/red = expensive options. The left wall is "
-                       "crash-insurance pricing; a surface towering at the front-left with an "
-                       "inverted term slope = market pricing imminent danger.")
+            st.caption("Drag to rotate. The 2D slices below cut through the 3D: term "
+                       "structure (left) inverts under stress; the smile (right) shows "
+                       "the crash-insurance premium on the left wing.")
         except Exception as exc:
             st.info(f"Surface unavailable for this date: {exc}")
 
-        if make_report:
-            with st.spinner("Generating Excel report..."):
+        st.subheader("Excel report")
+        if st.button("📄 Generate & archive Excel report"):
+            with st.spinner("Generating Excel report (10-20s)..."):
                 try:
                     path = build_report(load_day(target))
-                    st.success(f"Excel report saved to:  `{path}`")
-                    with open(path, "rb") as f:
-                        st.download_button("Download report", f,
-                                           file_name=path.name,
-                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    st.session_state["report_path"] = str(path)
                 except Exception as exc:
                     st.error(f"Report generation failed: {exc}")
-        else:
-            st.caption("Report generation is off — flip the toggle above and rerun the "
-                       "scan if you want this day archived as an Excel report.")
+
+        rp = st.session_state.get("report_path")
+        if rp:
+            st.success(f"Report saved to:  `{rp}`")
+            with open(rp, "rb") as f:
+                st.download_button("Download report", f, file_name=Path(rp).name,
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
