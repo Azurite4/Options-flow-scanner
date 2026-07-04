@@ -99,3 +99,25 @@ Data files are not in the repo (gitignored — too big, and the historical
 files are licensed to my account). To rebuild: run `src/db.py`, download
 the free SPY EOD files from optionsdx.com into `data/optionsdx/`, run
 `src/backfill.py`, then `src/detector.py --daily-scores`.
+
+### Second study: does put-call skew predict? (spoiler: it's regime-dependent)
+
+Since the volume study came back null, I tested a signal with an actual
+academic prior: put-call skew (the price gap between 5% OTM puts and calls —
+the market's crash-insurance premium). Two pre-declared hypotheses: steep
+skew *levels* and rapid skew *steepening*, same bootstrap framework, same
+gap guards.
+
+The raw result looked spectacular: steep-skew days in 2020–2021 were
+followed by strongly positive returns and higher volatility (p < 0.01
+across horizons). But the sub-period discipline caught it again — the
+effect is completely absent in 2022–2023, the level-based signal barely
+fires outside the high-vol era (4 event days in two years, untestable),
+and fear days cluster so heavily that 28 "independent" events are really
+a handful of episodes. The honest conclusion: during the post-COVID
+recovery, buying after fear spikes paid — but so did buying after
+everything. That's a regime story, not an edge.
+
+Both open hypotheses (put-tilt volatility, skew-level returns) are frozen
+and tracked out-of-sample in the app as daily collection accumulates data
+that didn't exist when they were formed.

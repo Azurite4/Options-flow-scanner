@@ -20,6 +20,8 @@ from report import load_day, build_report
 from vol_surface import load_chain_day, build_grid, surface_stats, plotly_surface
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "options.db"
+ROOT_SCORES = Path(__file__).resolve().parent.parent / "data" / "daily_scores.csv"
+ROOT_VOL = Path(__file__).resolve().parent.parent / "data" / "vol_metrics.csv"
 
 st.set_page_config(page_title="Options Flow Scanner", layout="wide")
 st.title("Options Flow Scanner")
@@ -39,8 +41,8 @@ d_min, d_max = date.fromisoformat(dates[0]), date.fromisoformat(dates[-1])
 n_2023_and_earlier = sum(1 for d in dates if d <= "2023-12-31")
 n_recent = len(dates) - n_2023_and_earlier
 
-tab_scan, tab_help = st.tabs(["🔍 Scanner", "📖 Instructions & Data Coverage"])
-
+tab_scan, tab_hyp, tab_help = st.tabs(
+    ["🔍 Scanner", "🧪 Hypothesis Tracker", "📖 Instructions & Data Coverage"])
 # ============================= HELP TAB =============================
 with tab_help:
     st.header("What this tool does")
@@ -54,6 +56,7 @@ with tab_help:
         "2020–2023 found **no evidence** that high anomaly scores predict "
         "SPY's direction. Treat this as a *barometer* of unusual activity, "
         "not a buy/sell signal."
+        "The 🧪 Hypothesis Tracker tab shows the two pre-registered hypotheses from our event studies accumulating out-of-sample evidence as daily collection grows."
     )
 
     st.header("Which date should I pick?")
@@ -106,6 +109,72 @@ automatically when the database is behind; (2) open **Maintenance** and hit
 scan. Steps 1–2 only matter for new days; historical dates are already scored.
 """
     )
+# ========================= HYPOTHESIS TRACKER =========================
+
+with tab_hyp:
+    st.header("Out-of-sample hypothesis tracker")
+    st.markdown(
+        "Two marginal results from the 2020–2023 studies were **pre-registered as "
+        "hypotheses**, not findings. Every day of live collection adds genuinely "
+        "out-of-sample evidence — data that did not exist when the hypotheses were "
+        "formed. This page accumulates that evidence. No peeking-based tweaks allowed: "
+        "the definitions below are frozen."
+    )
+    OOS_START = "2026-07-01"
+
+    sc = pd.read_csv(ROOT_SCORES, parse_dates=["date"]) if ROOT_SCORES.exists() else None
+    vm = pd.read_csv(ROOT_VOL, parse_dates=["date"]) if ROOT_VOL.exists() else None
+
+    def fwd5(df):
+        df = df.sort_values("date").reset_index(drop=True)
+        df["fwd_ret_5d"] = df["spot"].shift(-5) / df["spot"] - 1
+        gap = (df["date"].shift(-5) - df["date"]).dt.days
+        df.loc[gap > 20, "fwd_ret_5d"] = pd.NA
+        return df
+
+    st.subheader("H1 — Put-tilted anomaly days precede larger 5-day moves")
+    st.caption("Definition (frozen): put_score − call_score in the top decile of the "
+               "expanding historical distribution. Prediction: larger |5-day return| than baseline.")
+    if sc is None:
+        st.info("daily_scores.csv not found — run the history refresh in Maintenance.")
+    else:
+        d = fwd5(sc.copy())
+        d["tilt"] = d["put_score"] - d["call_score"]
+        d["thresh"] = d["tilt"].expanding(min_periods=100).quantile(0.90).shift(1)
+        oos = d[(d["date"] >= OOS_START)]
+        ev = oos[oos["tilt"] > oos["thresh"]].dropna(subset=["fwd_ret_5d"])
+        base = oos[oos["tilt"] <= oos["thresh"]].dropna(subset=["fwd_ret_5d"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("OOS event days so far", len(ev))
+        c2.metric("Event mean |5d move|",
+                  f"{abs(ev['fwd_ret_5d']).mean()*100:.2f}%" if len(ev) else "—")
+        c3.metric("Baseline mean |5d move|",
+                  f"{abs(base['fwd_ret_5d']).mean()*100:.2f}%" if len(base) else "—")
+        if len(ev) < 15:
+            st.caption(f"Verdict pending — need ~15+ event days for a meaningful test "
+                       f"(likely 6–12 months of collection).")
+
+    st.subheader("H2 — Steep/steepening skew precedes positive returns (regime question)")
+    st.caption("Definition (frozen): skew or its 5-day change in the top decile, expanding "
+               "threshold. 2020–21 said yes strongly; 2022–23 said no. Out-of-sample data "
+               "is the tiebreaker.")
+    if vm is None or sc is None:
+        st.info("vol_metrics.csv not found — run the history refresh in Maintenance.")
+    else:
+        d = vm.merge(sc[["date", "spot"]], on="date", how="inner")
+        d = fwd5(d.dropna(subset=["skew"]).copy())
+        d["thresh"] = d["skew"].expanding(min_periods=100).quantile(0.90).shift(1)
+        oos = d[d["date"] >= OOS_START]
+        ev = oos[oos["skew"] > oos["thresh"]].dropna(subset=["fwd_ret_5d"])
+        base = oos[oos["skew"] <= oos["thresh"]].dropna(subset=["fwd_ret_5d"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("OOS steep-skew days so far", len(ev))
+        c2.metric("Event mean 5d return",
+                  f"{ev['fwd_ret_5d'].mean()*100:+.2f}%" if len(ev) else "—")
+        c3.metric("Baseline mean 5d return",
+                  f"{base['fwd_ret_5d'].mean()*100:+.2f}%" if len(base) else "—")
+        if len(ev) < 15:
+            st.caption("Verdict pending — evidence accumulates with every collection day.")
 
 # ============================ SCANNER TAB ============================
 with tab_scan:
