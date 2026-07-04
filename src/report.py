@@ -16,6 +16,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from detector import (load_universe, bucket_baseline, score_day,
                       flags_for_day, composite, LOOKBACK_DAYS, MIN_HISTORY)
 from vol_metrics import day_metrics, load_metrics
+from vol_surface import load_chain_day, build_grid, surface_stats, heatmap_png
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "options.db"
@@ -316,6 +317,25 @@ def build_report(df: pd.DataFrame) -> Path:
     ws3.add_image(XLImage(str(p)), "A45")
     note(ws3, 62, "SPY volume normally concentrates in the shortest expiries. A shift toward "
                   "longer-dated contracts can mean positioning for events further out.")
+    # Chart D: IV surface heatmap
+    try:
+        grid = build_grid(load_chain_day(snap))
+        p = REPORTS / "_c_surface.png"
+        heatmap_png(grid, snap, p)
+        tmp_charts.append(p)
+        ws3.add_image(XLImage(str(p)), "A65")
+        sstats = surface_stats(grid)
+        slope = sstats.get("term_slope")
+        slope_txt = (f"{slope:+.3f} "
+                     f"({'INVERTED — the market is pricing imminent stress' if slope < 0 else 'normal upward slope'})"
+                     if slope is not None else "n/a")
+        note(ws3, 87, f"The implied volatility surface: what the market charges for options at "
+                      f"every strike and expiry. Red = expensive. The left side is crash "
+                      f"insurance; if the top row (shortest expiries) runs hotter than the "
+                      f"bottom rows, the market fears the immediate future more than the "
+                      f"distant one. Term-structure slope today: {slope_txt}.")
+    except Exception:
+        note(ws3, 65, "IV surface unavailable for this date (insufficient clean IV data).")
 
     # ============ Sheet 4: CHAIN OVERVIEW ============
     ws4 = wb.create_sheet("Chain Overview")

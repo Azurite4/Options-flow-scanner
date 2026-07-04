@@ -17,6 +17,7 @@ from db import get_connection, insert_rows
 from detector import (run_daily_scores, load_universe, bucket_baseline, score_day,
                       flags_for_day, composite, LOOKBACK_DAYS, MIN_HISTORY)
 from report import load_day, build_report
+from vol_surface import load_chain_day, build_grid, surface_stats, plotly_surface
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "options.db"
 
@@ -180,7 +181,13 @@ with tab_scan:
         st.info(f"No snapshot for {picked} (weekend, holiday, or data gap). "
                 f"Using the most recent trading day before it: **{target}**")
 
-    run = st.button(f"Run scan for {target}", type="primary")
+    col_run, col_toggle = st.columns([1, 2])
+    with col_toggle:
+        make_report = st.toggle("Generate Excel report after scan", value=False,
+                                help="Off = quick scan only (faster). On = also build and "
+                                     "archive the full Excel report in reports/.")
+    with col_run:
+        run = st.button(f"Run scan for {target}", type="primary")
 
     if run:
         with st.spinner("Scoring chain against trailing baseline..."):
@@ -229,14 +236,37 @@ with tab_scan:
             show["dist"] = (show["dist"] * 100).round(1)
             show = show.rename(columns={"dist": "% from spot"})
             st.dataframe(show, use_container_width=True, hide_index=True)
+        st.subheader("Implied volatility surface")
+        try:
+            grid = build_grid(load_chain_day(target))
+            sstats = surface_stats(grid)
+            sc1, sc2 = st.columns(2)
+            slope = sstats.get("term_slope")
+            sc1.metric("Term-structure slope",
+                       f"{slope:+.3f}" if slope is not None else "n/a",
+                       delta="INVERTED — stress" if slope is not None and slope < 0
+                             else "normal", delta_color="inverse")
+            lw = sstats.get("left_wing")
+            sc2.metric("Left-wing steepness (~1m)",
+                       f"{lw:+.3f}" if lw is not None else "n/a")
+            st.plotly_chart(plotly_surface(grid, target), use_container_width=True)
+            st.caption("Drag to rotate. Height/red = expensive options. The left wall is "
+                       "crash-insurance pricing; a surface towering at the front-left with an "
+                       "inverted term slope = market pricing imminent danger.")
+        except Exception as exc:
+            st.info(f"Surface unavailable for this date: {exc}")
 
-        with st.spinner("Generating Excel report..."):
-            try:
-                path = build_report(load_day(target))
-                st.success(f"Excel report saved to:  `{path}`")
-                with open(path, "rb") as f:
-                    st.download_button("Download report", f,
-                                       file_name=path.name,
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            except Exception as exc:
-                st.error(f"Report generation failed: {exc}")
+        if make_report:
+            with st.spinner("Generating Excel report..."):
+                try:
+                    path = build_report(load_day(target))
+                    st.success(f"Excel report saved to:  `{path}`")
+                    with open(path, "rb") as f:
+                        st.download_button("Download report", f,
+                                           file_name=path.name,
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                except Exception as exc:
+                    st.error(f"Report generation failed: {exc}")
+        else:
+            st.caption("Report generation is off — flip the toggle above and rerun the "
+                       "scan if you want this day archived as an Excel report.")
