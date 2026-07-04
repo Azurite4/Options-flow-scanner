@@ -337,6 +337,30 @@ def build_report(df: pd.DataFrame) -> Path:
     except Exception:
         note(ws3, 65, "IV surface unavailable for this date (insufficient clean IV data).")
 
+    # Chart E: volatility metrics history
+    vh = load_metrics()
+    if vh is not None and not vh.empty:
+        fig, axes = plt.subplots(2, 1, figsize=(9, 4.6), sharex=True)
+        axes[0].plot(vh["date"], vh["atm_iv"], lw=0.8, color="#1F3864")
+        axes[0].set_title("ATM implied vol (20-45 DTE) — our homemade VIX")
+        axes[1].plot(vh["date"], vh["skew"], lw=0.8, color="#C62828")
+        axes[1].set_title("Put-call skew (5% OTM wings) — the fear premium")
+        this_day = vh[vh["date"] == pd.Timestamp(snap)]
+        if not this_day.empty:
+            axes[0].scatter(this_day["date"], this_day["atm_iv"], s=60, color="#C62828", zorder=5)
+            axes[1].scatter(this_day["date"], this_day["skew"], s=60, color="#1F3864", zorder=5)
+        fig.tight_layout()
+        p = REPORTS / "_c_volhist.png"
+        fig.savefig(p, dpi=110)
+        plt.close(fig)
+        tmp_charts.append(p)
+        ws3.add_image(XLImage(str(p)), "A89")
+        note(ws3, 116, "Top: the market's priced-in expectation of movement over time — spikes are "
+                       "crises (Mar 2020 dominates). Bottom: the crash-insurance premium; note it "
+                       "can spike while overall vol is calm (late Feb 2020, Omicron Nov 2021) — "
+                       "fear showing up in prices before it shows up in headlines. The dot marks "
+                       "this report's day.")
+
     # ============ Sheet 4: CHAIN OVERVIEW ============
     ws4 = wb.create_sheet("Chain Overview")
     title(ws4, "Raw top-volume contracts (unfiltered)")
@@ -390,6 +414,45 @@ def build_report(df: pd.DataFrame) -> Path:
         ws5.row_dimensions[r + 1].height = 45
         r += 3
     ws5.column_dimensions["A"].width = 100
+
+    # ============ Sheet 6: RESEARCH FINDINGS ============
+    ws6 = wb.create_sheet("Research Findings")
+    title(ws6, "What we've actually tested (and what we found)")
+    findings = [
+        ("Study 1 — Do volume anomalies predict SPY? (2020-2023)",
+         "No. Top-decile anomaly-score days show no statistically significant difference in "
+         "forward returns (direction) at 1, 3 or 5 days, pooled or by sub-period. An initially "
+         "'significant' volatility effect (p≈0.01) turned out to be a data-boundary bug — "
+         "forward returns computed across a 2.5-year gap — and died when fixed. Lesson kept: "
+         "the most exciting number in a backtest is usually an artifact."),
+        ("Open hypothesis 1 — Put-tilted days and 5-day volatility",
+         "Days where put anomalies dominate call anomalies showed slightly larger 5-day moves "
+         "(p≈0.03 on both t-test and bootstrap). But it appears at only one horizon of three, "
+         "and ~18 tests were run, so one hit at p≈0.03 is roughly what chance predicts. Status: "
+         "hypothesis, not finding. Daily collection is accumulating true out-of-sample evidence."),
+        ("Study 2 — Does put-call skew predict SPY? (2020-2023)",
+         "Regime-dependent. Steep-skew and rapidly-steepening days were followed by strongly "
+         "positive returns and higher volatility in 2020-2021 (p<0.01 across horizons) — but "
+         "the effect is fully absent in 2022-2023, and the level-based signal barely fires "
+         "outside the high-vol era (4 event days in two years). The 2020-21 result is "
+         "indistinguishable from 'that regime rewarded buying every dip.' Status: regime story, "
+         "tracked out-of-sample."),
+        ("What the tool is, given all this",
+         "A barometer, not a crystal ball. It reliably identifies WHEN and WHERE options "
+         "activity is historically unusual (validated on COVID, the Jan-2021 mania, SVB, and "
+         "the Omicron skew spike) — it does not tell you what happens next, and these studies "
+         "are the receipts for why we won't claim otherwise."),
+    ]
+    r = 3
+    for heading, body in findings:
+        ws6.cell(row=r, column=1, value=heading).font = Font(bold=True, name="Arial")
+        c = ws6.cell(row=r + 1, column=1, value=body)
+        c.font = BODY_FONT
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws6.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=6)
+        ws6.row_dimensions[r + 1].height = 72
+        r += 3
+    ws6.column_dimensions["A"].width = 105
 
     wb.save(out)
     for p in tmp_charts:
