@@ -1,5 +1,5 @@
-"""Generate a dated Excel report into reports/ — now including the
-detector's scored anomalies, composite score context, and explanations."""
+"""Generate a dated Excel report into reports/ — dashboard with verdict,
+scored anomalies, volatility metrics, captioned charts, methodology page."""
 
 import sqlite3
 from pathlib import Path
@@ -15,6 +15,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 from detector import (load_universe, bucket_baseline, score_day,
                       flags_for_day, composite, LOOKBACK_DAYS, MIN_HISTORY)
+from vol_metrics import day_metrics, load_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "options.db"
@@ -25,10 +26,11 @@ NAVY = "1F3864"
 HEADER_FILL = PatternFill("solid", start_color=NAVY)
 HEADER_FONT = Font(bold=True, color="FFFFFF", name="Arial")
 TITLE_FONT = Font(bold=True, size=14, name="Arial", color=NAVY)
+SECTION_FONT = Font(bold=True, size=12, name="Arial", color=NAVY)
 BODY_FONT = Font(name="Arial")
 NOTE_FONT = Font(name="Arial", italic=True, size=9, color="808080")
 BIG_METRIC = Font(bold=True, size=22, name="Arial", color=NAVY)
-SEV_FILLS = {  # severity shading for anomaly rows, by robust z
+SEV_FILLS = {
     "high": PatternFill("solid", start_color="F8CBAD"),
     "med": PatternFill("solid", start_color="FFE699"),
 }
@@ -61,7 +63,6 @@ def load_scores() -> pd.DataFrame | None:
 
 
 def run_detector(target: str):
-    """Score the target day. Returns (flags, composite_dict) or (None, None)."""
     conn = sqlite3.connect(DB_PATH)
     uni = load_universe(conn)
     conn.close()
@@ -78,8 +79,6 @@ def run_detector(target: str):
     scored = score_day(today, bucket_baseline(history))
     return flags_for_day(scored), composite(scored, history)
 
-
-# ---------- small writing helpers ----------
 
 def title(ws, text: str):
     ws["A1"] = text
@@ -122,12 +121,10 @@ def verdict_text(pct: float | None, comp: dict | None) -> str:
         level = "NORMAL — routine options activity"
     else:
         level = "QUIET — below-average unusual activity"
-    tilt = ("puts" if comp["put_score"] > comp["call_score"] else "calls")
+    tilt = "puts" if comp["put_score"] > comp["call_score"] else "calls"
     return (f"{level}. Anomalous activity today tilts toward {tilt} "
             f"(put score {comp['put_score']:.2f} vs call score {comp['call_score']:.2f}).")
 
-
-# ---------- the report ----------
 
 def build_report(df: pd.DataFrame) -> Path:
     REPORTS.mkdir(exist_ok=True)
@@ -164,7 +161,7 @@ def build_report(df: pd.DataFrame) -> Path:
     ws["C5"].font = BIG_METRIC
     ws["E4"] = "All-time rank"
     ws["E4"].font = BODY_FONT
-    ws["E5"] = (f"{rank} of {len(scores)}" if rank is not None else "n/a")
+    ws["E5"] = f"{rank} of {len(scores)}" if rank is not None else "n/a"
     ws["E5"].font = BIG_METRIC
 
     ws["A7"] = "Verdict"
@@ -199,14 +196,43 @@ def build_report(df: pd.DataFrame) -> Path:
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 70
 
+    # ---- Volatility section ----
+    vm = day_metrics(df)
+    vhist = load_metrics()
+    r0 = 20
+    ws.cell(row=r0, column=1, value="Volatility (from implied vols)").font = SECTION_FONT
+
+    def _pctile(col, val):
+        if vhist is None or pd.isna(val):
+            return "n/a"
+        s = vhist[col].dropna()
+        return f"{(s <= val).mean() * 100:.0f}th percentile since 2020"
+
+    vol_stats = pd.DataFrame({
+        "Metric": ["ATM implied vol (20-45 DTE)", "Put-call skew (5% OTM wings)"],
+        "Value": [f"{vm['atm_iv']:.3f}" if pd.notna(vm["atm_iv"]) else "n/a",
+                  f"{vm['skew']:.4f}" if pd.notna(vm["skew"]) else "n/a"],
+        "Context": [_pctile("atm_iv", vm["atm_iv"]), _pctile("skew", vm["skew"])],
+        "How to read it": [
+            "The market's priced-in expectation of SPY movement — our homemade VIX. "
+            "High percentile = market braced for turbulence.",
+            "How much more expensive crash insurance (puts) is than upside bets (calls). "
+            "Steep skew = fear being priced in, sometimes before volume shows it.",
+        ],
+    })
+    write_table(ws, r0 + 1, vol_stats)
+    ws.column_dimensions["D"].width = 70
+
     # ============ Sheet 2: ANOMALIES ============
     ws2 = wb.create_sheet("Anomalies")
     title(ws2, "Flagged contracts — what made today unusual")
     note(ws2, 2, "Each row is a contract trading far above the normal level for its kind "
                  "(same side, similar % from spot, similar time to expiry). 'Baseline' is the "
                  "median volume for that kind of contract over the last 60 trading days; "
-                 "'Excess' is contracts above that. Rows are shaded by severity "
-                 "(orange = extreme, yellow = strong). OTM/near-ATM contracts only.")
+                 "'Excess' is contracts above that. Rows shaded by severity (orange = extreme, "
+                 "yellow = strong). 'IV vs normal' above ~1.15 alongside a volume spike suggests "
+                 "aggressive buying pressure; near or below 1.0 suggests selling or spread "
+                 "activity. OTM/near-ATM contracts only.")
 
     if flags is None:
         note(ws2, 4, "Not enough trailing history to score this date.")
@@ -214,31 +240,31 @@ def build_report(df: pd.DataFrame) -> Path:
         note(ws2, 4, "No anomalies — a quiet, normal day in the speculation zone.")
     else:
         show = flags.head(40)[["option_type", "strike", "expiry", "dte", "dist",
-                               "volume", "med", "excess_vol", "robust_z", "implied_vol"]].copy()
+                               "volume", "med", "excess_vol", "robust_z",
+                               "implied_vol", "iv_vs_normal"]].copy()
         show["expiry"] = show["expiry"].dt.date.astype(str)
         show["dist"] = (show["dist"] * 100).round(1)
         show[["med", "excess_vol", "robust_z"]] = show[["med", "excess_vol", "robust_z"]].round(1)
         show["implied_vol"] = show["implied_vol"].round(3)
-        show.columns = ["Type", "Strike", "Expiry", "DTE", "% from spot",
-                        "Volume", "Baseline", "Excess", "Robust z", "IV"]
+        show["iv_vs_normal"] = pd.to_numeric(show["iv_vs_normal"], errors="coerce").round(2)
+        show.columns = ["Type", "Strike", "Expiry", "DTE", "% from spot", "Volume",
+                        "Baseline", "Excess", "Robust z", "IV", "IV vs normal"]
         end = write_table(ws2, 4, show)
-        # severity shading by robust z
         for r in range(5, end):
             z = ws2.cell(row=r, column=9).value
             fill = SEV_FILLS["high"] if z and z >= 30 else (
                 SEV_FILLS["med"] if z and z >= 10 else None)
             if fill:
-                for c in range(1, 11):
+                for c in range(1, 12):
                     ws2.cell(row=r, column=c).fill = fill
         ws2.freeze_panes = "A5"
-        for col, w in zip("ABCDEFGHIJ", [7, 9, 12, 6, 12, 11, 11, 11, 10, 8]):
+        for col, w in zip("ABCDEFGHIJK", [7, 9, 12, 6, 12, 11, 11, 11, 10, 8, 13]):
             ws2.column_dimensions[col].width = w
 
     # ============ Sheet 3: CHARTS ============
     ws3 = wb.create_sheet("Charts")
     title(ws3, "Visual overview")
 
-    # Chart A: score history
     if scores is not None and row_today is not None:
         fig, ax = plt.subplots(figsize=(9, 3.2))
         ax.plot(scores["date"], scores["score"], lw=0.7, color="#1F3864")
@@ -258,7 +284,6 @@ def build_report(df: pd.DataFrame) -> Path:
                       "top 10% of unusual activity ever recorded by this tool. The big cluster "
                       "in early 2021 is the meme-stock mania — the most anomalous period in the sample.")
 
-    # Chart B: volume by strike near the money
     fig, ax = plt.subplots(figsize=(9, 3.2))
     near = df[(df["moneyness"].between(0.9, 1.1)) & (df["dte"] <= 30)]
     for opt, color, lbl in (("C", "#2E7D32", "Calls"), ("P", "#C62828", "Puts")):
@@ -277,7 +302,6 @@ def build_report(df: pd.DataFrame) -> Path:
                   "Below spot = put-side interest (hedging/downside bets). A big isolated spike "
                   "at one strike is often a single institutional trade.")
 
-    # Chart C: volume by DTE
     fig, ax = plt.subplots(figsize=(9, 3.0))
     buckets = pd.cut(df["dte"], bins=[-1, 1, 7, 30, 90, 10_000],
                      labels=["0-1d", "2-7d", "8-30d", "31-90d", ">90d"])
@@ -293,7 +317,7 @@ def build_report(df: pd.DataFrame) -> Path:
     note(ws3, 62, "SPY volume normally concentrates in the shortest expiries. A shift toward "
                   "longer-dated contracts can mean positioning for events further out.")
 
-    # ============ Sheet 4: CHAIN OVERVIEW (raw) ============
+    # ============ Sheet 4: CHAIN OVERVIEW ============
     ws4 = wb.create_sheet("Chain Overview")
     title(ws4, "Raw top-volume contracts (unfiltered)")
     note(ws4, 2, "The 25 busiest contracts by raw volume, no statistical filter. Expect the "
@@ -325,6 +349,10 @@ def build_report(df: pd.DataFrame) -> Path:
         ("Robust z", "How many robust standard deviations above the baseline a contract traded. "
          "Options volume is fat-tailed, so a z of 5+ is common on busy days; the shading uses "
          "10+ and 30+ as meaningful tiers."),
+        ("Volatility metrics", "ATM implied vol is the market's priced-in expectation of "
+         "movement (a homemade VIX). Skew is the price gap between 5% OTM puts and calls — "
+         "a fear gauge that can move before volume does. Both come with percentile context "
+         "against every day since 2020."),
         ("What this does NOT do", "Predict direction. An event study over 2020–2023 found no "
          "evidence that high-score days predict which way SPY moves next. Treat this as a "
          "barometer of unusual activity, not a trading signal."),

@@ -11,9 +11,10 @@ import pandas as pd
 import pandas_market_calendars as mcal
 import streamlit as st
 
+from vol_metrics import build_history
 from collector import fetch_chain_rows, TICKERS
 from db import get_connection, insert_rows
-from detector import (load_universe, bucket_baseline, score_day,
+from detector import (run_daily_scores, load_universe, bucket_baseline, score_day,
                       flags_for_day, composite, LOOKBACK_DAYS, MIN_HISTORY)
 from report import load_day, build_report
 
@@ -98,8 +99,10 @@ Two layers of comparison happen on every scan:
    Context* sheet shows. A day in the 95th percentile is behaving like the
    SVB collapse or COVID-crash era; a day at the 40th is business as usual.
 
-To refresh the all-time score table after new collection days, run:
-`py src\\detector.py --daily-scores`
+The daily workflow after market close: (1) collect data — the button appears
+automatically when the database is behind; (2) open **Maintenance** and hit
+*Refresh score & volatility history* so the new day gets scored; (3) run the
+scan. Steps 1–2 only matter for new days; historical dates are already scored.
 """
     )
 
@@ -152,6 +155,20 @@ with tab_scan:
         st.caption(f"✅ Data is up to date (latest snapshot: {latest_in_db}).")
     # -------------------------------------------------------------
 
+    with st.expander("🔧 Maintenance — refresh history tables"):
+        st.markdown(
+            "The percentile rankings and volatility context in reports come from two "
+            "pre-computed tables (`daily_scores.csv` and `vol_metrics.csv`). **Run this "
+            "after collecting new data** so new days get scored and included in the "
+            "history. Takes a few minutes — it re-scores every day since 2020."
+        )
+        if st.button("Refresh score & volatility history"):
+            with st.spinner("Rebuilding daily anomaly scores (this is the slow part)..."):
+                run_daily_scores()
+            with st.spinner("Rebuilding volatility metrics..."):
+                build_history()
+            get_dates.clear()
+            st.success("History tables refreshed — new reports will include the latest days.")
 
     picked = st.date_input("Pick a date", value=d_max, min_value=d_min, max_value=d_max)
     target = max((d for d in dates if d <= picked.isoformat()), default=None)

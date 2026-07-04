@@ -81,10 +81,12 @@ def bucket_baseline(history: pd.DataFrame) -> pd.DataFrame:
     def mad(x):
         return np.median(np.abs(x - np.median(x)))
     g = history.groupby("bucket", observed=True)["volume"]
+    iv = history[(history["implied_vol"] > 0.03) & (history["implied_vol"] < 3.0)]
     base = pd.DataFrame({
         "med": g.median(),
         "mad": g.apply(mad) * MAD_SCALE,
         "n": g.count(),
+        "iv_med": iv.groupby("bucket", observed=True)["implied_vol"].median(),
     })
     # Floor MAD so buckets where >half of volumes are identical don't divide by 0
     base["mad"] = base["mad"].clip(lower=1.0)
@@ -95,6 +97,7 @@ def score_day(today: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     t = today.join(base, on="bucket")
     t["robust_z"] = (t["volume"] - t["med"]) / t["mad"]
     t["excess_vol"] = (t["volume"] - t["med"]).clip(lower=0)
+    t["iv_vs_normal"] = t["implied_vol"] / t["iv_med"]
     return t
 
 
