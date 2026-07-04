@@ -106,31 +106,72 @@ def heatmap_png(grid: pd.DataFrame, target: str, out_path: Path) -> Path:
     return out_path
 
 
-def plotly_surface(grid: pd.DataFrame, target: str):
-    """Interactive 3D surface for the Streamlit GUI."""
+def plotly_surface(grid: pd.DataFrame, target: str, absolute_scale: bool = True):
+    """Interactive 3D surface. absolute_scale=True pins the z-axis and colors
+    to a fixed 0-100% IV range so surfaces are comparable across dates;
+    False lets the day fill the frame (shape detail, no comparability)."""
     import plotly.graph_objects as go
 
     money_mids = [(float(c.split("-")[0]) + float(c.split("-")[1])) / 2
                   for c in grid.columns]
-    fig = go.Figure(data=[go.Surface(
-        z=grid.values * 100,
-        x=money_mids,
-        y=list(range(len(grid.index))),
+    z = grid.values * 100
+    surf = dict(
+        z=z, x=money_mids, y=list(range(len(grid.index))),
         colorscale="RdYlGn", reversescale=True,
-        colorbar=dict(title="IV %"),
-        connectgaps=True,
-    )])
-    fig.update_layout(
-        title=f"Implied volatility surface — {target}",
-        scene=dict(
-            xaxis_title="Moneyness (strike/spot)",
-            yaxis=dict(title="Expiry", tickvals=list(range(len(grid.index))),
-                       ticktext=list(grid.index)),
-            zaxis_title="IV %",
-            camera=dict(eye=dict(x=-1.6, y=-1.6, z=0.9)),
-        ),
-        height=560, margin=dict(l=10, r=10, t=40, b=10),
+        colorbar=dict(title="IV %"), connectgaps=True,
     )
+    if absolute_scale:
+        surf["cmin"], surf["cmax"] = 0, 60   # fixed color meaning across all dates
+
+    fig = go.Figure(data=[go.Surface(**surf)])
+    scene = dict(
+        xaxis_title="Moneyness (strike/spot)",
+        yaxis=dict(title="Expiry", tickvals=list(range(len(grid.index))),
+                   ticktext=list(grid.index)),
+        zaxis_title="IV %",
+        camera=dict(eye=dict(x=-1.6, y=-1.6, z=0.9)),
+    )
+    if absolute_scale:
+        scene["zaxis"] = dict(title="IV %", range=[0, 100])
+    fig.update_layout(title=f"Implied volatility surface — {target}"
+                            + ("  (absolute scale)" if absolute_scale else "  (auto scale)"),
+                      scene=scene, height=560, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+def term_structure_fig(grid: pd.DataFrame, target: str):
+    """2D slice: ATM IV vs expiry. Upward slope = normal; downward = stress."""
+    import plotly.graph_objects as go
+
+    money_mids = np.array([(float(c.split("-")[0]) + float(c.split("-")[1])) / 2
+                           for c in grid.columns])
+    atm_col = grid.columns[np.argmin(np.abs(money_mids - 1.0))]
+    s = grid[atm_col] * 100
+    fig = go.Figure(go.Scatter(x=list(grid.index), y=s.values,
+                               mode="lines+markers", line=dict(color="#1F3864")))
+    fig.update_layout(title=f"ATM term structure — {target}",
+                      xaxis_title="Expiry", yaxis_title="ATM IV %",
+                      yaxis=dict(range=[0, max(40, float(s.max()) * 1.15)]),
+                      height=320, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
+
+def smile_fig(grid: pd.DataFrame, target: str, row: str = "1-2m"):
+    """2D slice: IV vs moneyness at one expiry bucket. The skew/smile view."""
+    import plotly.graph_objects as go
+
+    if row not in grid.index:
+        row = grid.index[len(grid.index) // 2]
+    money_mids = [(float(c.split("-")[0]) + float(c.split("-")[1])) / 2
+                  for c in grid.columns]
+    s = grid.loc[row] * 100
+    fig = go.Figure(go.Scatter(x=money_mids, y=s.values,
+                               mode="lines+markers", line=dict(color="#C62828")))
+    fig.add_vline(x=1.0, line_dash="dash", line_color="gray")
+    fig.update_layout(title=f"Skew/smile at {row} — {target}",
+                      xaxis_title="Moneyness (strike/spot)", yaxis_title="IV %",
+                      yaxis=dict(range=[0, max(40, float(s.max()) * 1.15)]),
+                      height=320, margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
 if __name__ == "__main__":

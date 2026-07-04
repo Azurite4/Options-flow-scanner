@@ -17,7 +17,8 @@ from db import get_connection, insert_rows
 from detector import (run_daily_scores, load_universe, bucket_baseline, score_day,
                       flags_for_day, composite, LOOKBACK_DAYS, MIN_HISTORY)
 from report import load_day, build_report
-from vol_surface import load_chain_day, build_grid, surface_stats, plotly_surface
+from vol_surface import (load_chain_day, build_grid, surface_stats,
+                         plotly_surface, term_structure_fig, smile_fig)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "options.db"
 ROOT_SCORES = Path(__file__).resolve().parent.parent / "data" / "daily_scores.csv"
@@ -318,7 +319,14 @@ with tab_scan:
             lw = sstats.get("left_wing")
             sc2.metric("Left-wing steepness (~1m)",
                        f"{lw:+.3f}" if lw is not None else "n/a")
-            st.plotly_chart(plotly_surface(grid, target), use_container_width=True)
+            abs_scale = st.toggle("Absolute scale (compare across dates)", value=True,
+                                  help="On: 0-100% IV fixed — crisis days tower, calm days "
+                                       "sit flat. Off: surface fills the frame (shape detail).")
+            st.plotly_chart(plotly_surface(grid, target, absolute_scale=abs_scale),
+                            use_container_width=True)
+            t1, t2 = st.columns(2)
+            t1.plotly_chart(term_structure_fig(grid, target), use_container_width=True)
+            t2.plotly_chart(smile_fig(grid, target), use_container_width=True)
             st.caption("Drag to rotate. Height/red = expensive options. The left wall is "
                        "crash-insurance pricing; a surface towering at the front-left with an "
                        "inverted term slope = market pricing imminent danger.")
